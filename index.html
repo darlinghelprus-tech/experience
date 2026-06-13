@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>Калькулятор стажа</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <style>
 :root {
   --accent: #2E2F33;
@@ -279,6 +280,16 @@ body {
   font-weight: 700;
 }
 
+.share-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.share-row .btn {
+  margin-bottom: 0;
+}
+
 .footer {
   text-align: center;
   margin-top: 16px;
@@ -336,6 +347,11 @@ body {
       <div class="result-sub">
         <span class="result-sub-label">Календарная длительность (без льгот)</span>
         <span class="result-sub-value" id="calOut">0 лет 0 мес 0 дн</span>
+      </div>
+
+      <div class="share-row">
+        <button id="shareBtn" class="btn btn-ghost">Поделиться результатом</button>
+        <button id="pdfBtn" class="btn btn-primary">Скачать PDF</button>
       </div>
     </section>
 
@@ -482,6 +498,19 @@ function pluralize(n, one, few, many) {
   return many;
 }
 
+let lastResult = null;
+
+function formatDate(str) {
+  if (!str) return '';
+  const [y, m, d] = str.split('-');
+  return `${d}.${m}.${y}`;
+}
+
+function coefLabel(coef) {
+  const found = COEF_OPTIONS.find((o) => o.value === coef);
+  return found ? found.label.replace(' (обычная служба)', '').replace(' (командировка/особые условия)', '') : `×${coef}`;
+}
+
 function calculate() {
   let cy = 0, cm = 0, cd = 0; // календарь без льгот, сумма по периодам
   let creditedExtraDays = 0; // дополнительные сутки от льготных коэффициентов
@@ -515,10 +544,127 @@ function calculate() {
   document.getElementById('daysOut').textContent = td;
   document.getElementById('calOut').textContent =
     `${cal.y} лет ${cal.m} мес ${cal.d} дн`;
+
+  lastResult = {
+    total: { years: ty, months: tm, days: td },
+    calendar: cal,
+    periods: periods.filter((p) => p.start && p.end && totalDays(p.start, p.end) > 0),
+  };
+}
+
+// Формирование текстового отчёта
+function buildReportText() {
+  if (!lastResult) return '';
+  const line = '━━━━━━━━━━━━━━━━━━';
+  const lines = [];
+  lines.push('🎖 Расчёт выслуги лет');
+  lines.push(line);
+  lines.push('Периоды службы:');
+  lastResult.periods.forEach((p, i) => {
+    lines.push(`${i + 1}. ${formatDate(p.start)} — ${formatDate(p.end)} (${coefLabel(p.coef)})`);
+  });
+  lines.push(line);
+  lines.push(`Выслуга (с учётом льгот): ${formatYMD(lastResult.total)}`);
+  lines.push(`Календарная выслуга (без льгот): ${lastResult.calendar.y} лет ${lastResult.calendar.m} мес ${lastResult.calendar.d} дн`);
+  lines.push(line);
+  lines.push('⚠️ Расчёт приблизительный, для уточнения обратитесь в кадровый орган.');
+  return lines.join('\n');
+}
+
+async function shareReport() {
+  if (!lastResult) { calculate(); }
+  const text = buildReportText();
+  if (!text) return;
+
+  if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.switchInlineQuery) {
+    try {
+      window.Telegram.WebApp.switchInlineQuery(text, ['users', 'groups']);
+      return;
+    } catch (e) {}
+  }
+
+  if (navigator.share) {
+    try {
+      await navigator.share({ title: 'Расчёт выслуги лет', text });
+      return;
+    } catch (e) {}
+  }
+
+  try {
+    await navigator.clipboard.writeText(text);
+    alert('Результат скопирован в буфер обмена');
+  } catch (e) {
+    alert(text);
+  }
+}
+
+// Генерация PDF
+function downloadPdf() {
+  if (!lastResult) { calculate(); }
+  if (!lastResult || !window.jspdf) return;
+
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF();
+  const marginX = 18;
+  let y = 20;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(16);
+  doc.text('Расчёт выслуги лет', marginX, y);
+  y += 10;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  doc.text(`Дата формирования: ${new Date().toLocaleDateString('ru-RU')}`, marginX, y);
+  y += 10;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.text('Периоды службы', marginX, y);
+  y += 8;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(11);
+  lastResult.periods.forEach((p, i) => {
+    doc.text(`${i + 1}. ${formatDate(p.start)} — ${formatDate(p.end)}  —  ${coefLabel(p.coef)}`, marginX, y);
+    y += 7;
+    if (y > 270) { doc.addPage(); y = 20; }
+  });
+
+  y += 6;
+  doc.setLineWidth(0.3);
+  doc.line(marginX, y, 210 - marginX, y);
+  y += 10;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(13);
+  doc.text('Итог', marginX, y);
+  y += 9;
+
+  doc.setFont('helvetica', 'normal');
+  doc.setFontSize(12);
+  doc.text(`Выслуга (с учётом льгот): ${formatYMD(lastResult.total)}`, marginX, y);
+  y += 8;
+  doc.text(
+    `Календарная выслуга (без льгот): ${lastResult.calendar.y} лет ${lastResult.calendar.m} мес ${lastResult.calendar.d} дн`,
+    marginX,
+    y
+  );
+  y += 14;
+
+  doc.setFontSize(9);
+  doc.setTextColor(140, 140, 140);
+  doc.text('Расчёт приблизительный, для уточнения обратитесь в кадровый орган.', marginX, y);
+
+  doc.save('vysluga.pdf');
 }
 
 document.getElementById('addBtn').addEventListener('click', () => addPeriod());
 document.getElementById('calcBtn').addEventListener('click', calculate);
+document.getElementById('shareBtn').addEventListener('click', shareReport);
+document.getElementById('pdfBtn').addEventListener('click', downloadPdf);
+
+
 
 // Переключение темы
 const themeToggle = document.getElementById('themeToggle');
