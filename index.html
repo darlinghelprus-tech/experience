@@ -349,6 +349,11 @@ body {
         <span class="result-sub-value" id="calOut">0 лет 0 мес 0 дн</span>
       </div>
 
+      <div class="result-sub">
+        <span class="result-sub-label">Льготная выслуга (доп. к календарной)</span>
+        <span class="result-sub-value" id="bonusOut">0 лет 0 мес 0 дн</span>
+      </div>
+
       <div class="share-row">
         <button id="shareBtn" class="btn btn-ghost">Поделиться результатом</button>
         <button id="pdfBtn" class="btn btn-primary">Скачать PDF</button>
@@ -582,6 +587,18 @@ function formatDate(str) {
   return `${d}.${m}.${y}`;
 }
 
+// Вычитание Y/M/D с заёмом (30 дней = 1 месяц, 12 месяцев = 1 год).
+// Используется, чтобы посчитать "льготную надбавку" по каждому отрезку
+// как разницу между переведённым в сутки итогом (с коэффициентом)
+// и его же реальной календарной длиной.
+function subtractYMD(a, b) {
+  let y = a.y - b.y, m = a.m - b.m, d = a.d - b.d;
+  if (d < 0) { d += 30; m -= 1; }
+  if (m < 0) { m += 12; y -= 1; }
+  if (y < 0) { y = 0; m = 0; d = 0; }
+  return { y, m, d };
+}
+
 function coefLabel(coef) {
   const found = COEF_OPTIONS.find((o) => o.value === coef);
   return found ? found.label.replace(' (обычная служба)', '').replace(' (командировка/особые условия)', '') : `×${coef}`;
@@ -597,29 +614,46 @@ function calculate() {
   //    и считаем календарную разницу одним вызовом на всю цепочку —
   //    так не теряется день на стыке периодов.
   const chains = buildChains(segments);
-  let cy = 0, cm = 0, cd = 0;
-  chains.forEach((chain) => {
-    const diff = calendarDiff(formatDateISO(chain.start), formatDateISO(chain.end));
-    cy += diff.y; cm += diff.m; cd += diff.d;
-  });
-  const cal = normalize(cy, cm, cd);
+  let cal;
+  if (chains.length === 1) {
+    // Для одной цепочки берём результат calendarDiff как есть. Его "дни"
+    // (0-30) — это позиция в месяце, а не сутки в льготном смысле, поэтому
+    // их нельзя "нормализовать" по правилу 30=1 месяц: иначе, например,
+    // 31.08 (2 мес 30 дн) и 01.09 (3 мес 0 дн) превратятся в одинаковые
+    // "3 мес 0 дн", хотя это разные по длине периоды.
+    const chain = chains[0];
+    cal = calendarDiff(formatDateISO(chain.start), formatDateISO(chain.end));
+  } else {
+    // Несколько несмежных цепочек (между периодами есть реальные разрывы) —
+    // суммируем их календарные разницы и переносим переполнение месяцев/лет.
+    let cy = 0, cm = 0, cd = 0;
+    chains.forEach((chain) => {
+      const diff = calendarDiff(formatDateISO(chain.start), formatDateISO(chain.end));
+      cy += diff.y; cm += diff.m; cd += diff.d;
+    });
+    cal = normalize(cy, cm, cd);
+  }
 
-  // 3. Дополнительные сутки от льготных коэффициентов считаем по отрезкам,
-  //    включительно (учитываем и первый, и последний день отрезка).
-  let creditedExtraDays = 0;
+  // 3. Льготная надбавка считается по каждому отрезку с коэффициентом != 1
+  //    отдельно: переводим длину отрезка с учётом коэффициента в сутки
+  //    (30 суток = 1 месяц, 12 месяцев = 1 год) и вычитаем из этого
+  //    реальную календарную длину того же отрезка. Разница — это и есть
+  //    "льготная" добавка, которая при сложении с календарной выслугой
+  //    даёт точный итог (без потерянных/лишних дней).
+  let by = 0, bm = 0, bd = 0;
   segments.forEach((seg) => {
     if (seg.coef === 1) return;
     const inclusiveDays = daysBetweenUTC(seg.start, seg.end) + 1;
-    creditedExtraDays += Math.round(inclusiveDays * (seg.coef - 1));
+    const creditedTotal = normalize(0, 0, Math.round(inclusiveDays * seg.coef));
+    const segCalendar = calendarDiff(formatDateISO(seg.start), formatDateISO(seg.end));
+    const segBonus = subtractYMD(creditedTotal, segCalendar);
+    by += segBonus.y; bm += segBonus.m; bd += segBonus.d;
   });
+  const bonus = normalize(by, bm, bd);
 
-  // итог с льготами = календарь без льгот + дополнительные сутки от коэффициентов
-  let ty = cal.y, tm = cal.m, td = cal.d;
-  if (creditedExtraDays > 0) {
-    const extra = normalize(0, 0, creditedExtraDays);
-    const fin = normalize(ty + extra.y, tm + extra.m, td + extra.d);
-    ty = fin.y; tm = fin.m; td = fin.d;
-  }
+  // итог с льготами = календарная выслуга + льготная надбавка
+  const fin = normalize(cal.y + bonus.y, cal.m + bonus.m, cal.d + bonus.d);
+  const ty = fin.y, tm = fin.m, td = fin.d;
 
   document.getElementById('totalOut').textContent = formatYMD({ years: ty, months: tm, days: td });
   document.getElementById('yearsOut').textContent = ty;
@@ -627,10 +661,13 @@ function calculate() {
   document.getElementById('daysOut').textContent = td;
   document.getElementById('calOut').textContent =
     `${cal.y} лет ${cal.m} мес ${cal.d} дн`;
+  document.getElementById('bonusOut').textContent =
+    `${bonus.y} лет ${bonus.m} мес ${bonus.d} дн`;
 
   lastResult = {
     total: { years: ty, months: tm, days: td },
     calendar: cal,
+    bonus,
     periods: periods.filter((p) => p.start && p.end && totalDays(p.start, p.end) > 0),
   };
 }
@@ -649,6 +686,7 @@ function buildReportText() {
   lines.push(line);
   lines.push(`Выслуга (с учётом льгот): ${formatYMD(lastResult.total)}`);
   lines.push(`Календарная выслуга (без льгот): ${lastResult.calendar.y} лет ${lastResult.calendar.m} мес ${lastResult.calendar.d} дн`);
+  lines.push(`Льготная выслуга (доп. к календарной): ${lastResult.bonus.y} лет ${lastResult.bonus.m} мес ${lastResult.bonus.d} дн`);
   lines.push(line);
   lines.push('⚠️ Расчёт приблизительный, для уточнения обратитесь в кадровый орган.');
   return lines.join('\n');
@@ -1727,6 +1765,12 @@ function downloadPdf() {
   y += 8;
   doc.text(
     `Календарная выслуга (без льгот): ${lastResult.calendar.y} лет ${lastResult.calendar.m} мес ${lastResult.calendar.d} дн`,
+    marginX,
+    y
+  );
+  y += 8;
+  doc.text(
+    `Льготная выслуга (доп. к календарной): ${lastResult.bonus.y} лет ${lastResult.bonus.m} мес ${lastResult.bonus.d} дн`,
     marginX,
     y
   );
