@@ -476,6 +476,82 @@ function normalize(y, m, d) {
   return { y, m, d };
 }
 
+// --- Работа с датами в UTC (чтобы не зависеть от часового пояса браузера) ---
+function parseDateUTC(str) {
+  const [y, m, d] = str.split('-').map(Number);
+  return new Date(Date.UTC(y, m - 1, d));
+}
+
+function formatDateISO(date) {
+  const y = date.getUTCFullYear();
+  const m = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(date.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+function addDaysUTC(date, days) {
+  return new Date(date.getTime() + days * 86400000);
+}
+
+function daysBetweenUTC(a, b) {
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}
+
+// Превращает введённые периоды (которые могут перекрываться или быть
+// вложенными друг в друга) в список непересекающихся отрезков.
+// Если новый период пересекается с уже добавленными ранее, более ранние
+// отрезки "разрезаются" так, чтобы освободить место для нового — то есть
+// период, введённый позже, имеет приоритет на пересекающемся участке.
+function normalizeSegments(list) {
+  let segments = [];
+
+  list.forEach((p) => {
+    if (!p.start || !p.end) return;
+    const s = parseDateUTC(p.start);
+    const e = parseDateUTC(p.end);
+    if (e < s) return;
+
+    const next = [];
+    segments.forEach((seg) => {
+      if (seg.end < s || seg.start > e) {
+        // пересечения нет — отрезок остаётся как есть
+        next.push(seg);
+        return;
+      }
+      // есть пересечение — оставляем только части, не попавшие в [s, e]
+      if (seg.start < s) {
+        next.push({ start: seg.start, end: addDaysUTC(s, -1), coef: seg.coef });
+      }
+      if (seg.end > e) {
+        next.push({ start: addDaysUTC(e, 1), end: seg.end, coef: seg.coef });
+      }
+    });
+
+    next.push({ start: s, end: e, coef: p.coef });
+    segments = next;
+  });
+
+  segments.sort((a, b) => a.start - b.start);
+  return segments.filter((seg) => seg.start <= seg.end);
+}
+
+// Объединяет соседние отрезки, которые идут "день в день" (конец одного —
+// это начало следующего минус один день), в общие цепочки. Это позволяет
+// считать календарную разницу одним вызовом calendarDiff на весь
+// непрерывный промежуток, без потери дня на стыках периодов.
+function buildChains(segments) {
+  const chains = [];
+  segments.forEach((seg) => {
+    const last = chains[chains.length - 1];
+    if (last && daysBetweenUTC(last.end, seg.start) === 1) {
+      last.end = seg.end;
+    } else {
+      chains.push({ start: seg.start, end: seg.end });
+    }
+  });
+  return chains;
+}
+
 function formatYMD({ years, months, days }) {
   return `${years} ${pluralYears(years)} ${months} ${pluralMonths(months)} ${days} ${pluralDays(days)}`;
 }
@@ -512,23 +588,30 @@ function coefLabel(coef) {
 }
 
 function calculate() {
-  let cy = 0, cm = 0, cd = 0; // календарь без льгот, сумма по периодам
-  let creditedExtraDays = 0; // дополнительные сутки от льготных коэффициентов
+  // 1. Превращаем введённые периоды в список непересекающихся отрезков
+  //    (если периоды перекрываются/вложены — позже введённый период
+  //    "вырезает" свой диапазон из более раннего).
+  const segments = normalizeSegments(periods);
 
-  periods.forEach((p) => {
-    if (!p.start || !p.end) return;
-    const days = totalDays(p.start, p.end);
-    if (days <= 0) return;
-
-    const diff = calendarDiff(p.start, p.end);
+  // 2. Соседние отрезки (стыкующиеся день в день) объединяем в цепочки
+  //    и считаем календарную разницу одним вызовом на всю цепочку —
+  //    так не теряется день на стыке периодов.
+  const chains = buildChains(segments);
+  let cy = 0, cm = 0, cd = 0;
+  chains.forEach((chain) => {
+    const diff = calendarDiff(formatDateISO(chain.start), formatDateISO(chain.end));
     cy += diff.y; cm += diff.m; cd += diff.d;
-
-    if (p.coef !== 1) {
-      creditedExtraDays += Math.round(days * (p.coef - 1));
-    }
   });
-
   const cal = normalize(cy, cm, cd);
+
+  // 3. Дополнительные сутки от льготных коэффициентов считаем по отрезкам,
+  //    включительно (учитываем и первый, и последний день отрезка).
+  let creditedExtraDays = 0;
+  segments.forEach((seg) => {
+    if (seg.coef === 1) return;
+    const inclusiveDays = daysBetweenUTC(seg.start, seg.end) + 1;
+    creditedExtraDays += Math.round(inclusiveDays * (seg.coef - 1));
+  });
 
   // итог с льготами = календарь без льгот + дополнительные сутки от коэффициентов
   let ty = cal.y, tm = cal.m, td = cal.d;
